@@ -1,0 +1,1 @@
+# NO-SINDy: Mesh-invariant sparse identification of non-linear dynamics
