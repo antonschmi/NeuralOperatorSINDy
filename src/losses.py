@@ -24,7 +24,7 @@ def sindy_ae_loss(cfg, model, batch, mask):
     loss_rec = jnp.mean((u_hat - u_t) ** 2)
     loss_dz = jnp.mean((dz_enc - dz_sindy) ** 2)
     loss_dx = jnp.mean((du_dec - u_dot) ** 2)
-    loss_sp = jnp.sum(jnp.abs(mask * xi))
+    loss_sp = jnp.mean(jnp.abs(mask * xi))
 
     z_centered = z - jnp.mean(z, axis=0, keepdims=True)
     cov = (z_centered.T @ z_centered) / z.shape[0]

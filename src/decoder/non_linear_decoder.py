@@ -2,12 +2,12 @@ import jax
 from jax.typing import ArrayLike
 import jax.numpy as jnp
 from typing import Sequence, Callable
-from decoder import Decoder
-from positional_encodings import (
+from src.decoder import Decoder
+from src.positional_encodings import (
     PositionalEncoding,
     IdentityEncoding,
 )
-from utils.networks import MLP
+from src.utils.networks import MLP
 from dataclasses import field
 
 
