@@ -16,6 +16,8 @@ class ExperimentalConfig:
     SEED: int = 42
     LINEAR_OBS: bool = True   # True -> linear Legendre observation; False -> + cubic terms
     DECODER: str = "linear"  # "linear" (DeepONet-style, linear in z) | "nonlinear" (MLP over concat(z, x))
+    SUBSAMPLE_POINTS: bool = True  # if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
+    N_SUB: int = 64          # points per row when SUBSAMPLE_POINTS is True; ignored otherwise
 
 
 @dataclass
@@ -38,6 +40,15 @@ class LossConfig:
     THRESHOLD: float = 0.1
     THRESH_START: int = 125_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch (first prune fires here, not before)
     THRESH_EVERY: int = 125_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch
+
+    # Path A: at each threshold step, 'sr3' replaces the absolute-threshold mask update
+    # (xi_np >= THRESHOLD) with a full pysindy SR3 solve on Theta(z) computed from the
+    # frozen encoder, instead of thresholding the co-trained xi directly. THRESHOLD is
+    # unused when SPARSITY_METHOD == 'sr3'.
+    SPARSITY_METHOD: str = 'relative_threshold'  # 'relative_threshold' (default, existing behavior) | 'sr3'
+    SR3_LAM: float = 0.05        # pysindy SR3 reg_weight_lam (L0 regularization weight)
+    SR3_NU: float = 1.0          # pysindy SR3 relax_coeff_nu
+    SR3_N_SAMPLES: int = 20_000  # fixed subsample size (rows of training_data) used for each SR3 solve
 
 @dataclass
 class Config:

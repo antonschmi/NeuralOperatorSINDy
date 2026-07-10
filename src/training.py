@@ -79,6 +79,36 @@ def sample_batch(data, batch_size, rng):
     return u, u_dot, x
 
 
+def sample_batch_subsampled(data, batch_size, n_sub, rng, key):
+    """
+    Like `sample_batch`, but each row in the batch gets its OWN independently-random
+    subset of `n_sub` (out of the full n_points_full) spatial points -- a genuinely
+    different point-cloud configuration per sample, not just per step. `sample_batch`
+    always hands every row the exact same fixed grid, so nothing before this ever
+    forced the encoder/decoder to handle heterogeneous point clouds within a single
+    gradient step -- this is the actual test of the mesh-invariance claim.
+
+    `key` is an ordinary jax.random.PRNGKey, split fresh by the caller every call; kept
+    separate from `rng` (the numpy Generator used for the outer ic/timestep sampling,
+    unchanged from `sample_batch`) since the per-point subsampling runs through
+    jax.random so it can be vmapped across the batch.
+    """
+    idx = rng.choice(data['x'].shape[0], size=batch_size, replace=False)
+    u_full = jnp.asarray(data['x'][idx])          # [B, n_points_full]
+    udot_full = jnp.asarray(data['dx'][idx])      # [B, n_points_full]
+    y_full = jnp.asarray(data['y_spatial'])       # [n_points_full]
+    n_points_full = y_full.shape[0]
+
+    keys = jax.random.split(key, batch_size)
+
+    def pick_and_gather(k, u_row, udot_row):
+        sub_idx = jax.random.choice(k, n_points_full, shape=(n_sub,), replace=False)
+        return u_row[sub_idx], udot_row[sub_idx], y_full[sub_idx]
+
+    u, udot, x = jax.vmap(pick_and_gather)(keys, u_full, udot_full)
+    return u[..., None], udot[..., None], x[..., None]
+
+
 def theta_jax(z, poly_order, latent_dim):
     """
     JAX polynomial library matching ps.PolynomialLibrary(degree=poly_order, include_bias=True).
@@ -95,6 +125,135 @@ def theta_jax(z, poly_order, latent_dim):
                 feat = feat * z[:, k]
             cols.append(feat)
     return jnp.stack(cols, axis=-1)
+
+
+def sr3_refit(model, params, cfg, training_data, rng, key):
+    """
+    Path A sparsity mechanism: instead of the co-trained `xi` being thresholded
+    directly (absolute |xi| >= THRESHOLD), freeze the encoder at its current `params`
+    and refit `xi` from scratch via pysindy's SR3 optimizer -- an L0-regularized sparse
+    regression solve on a precomputed library -- rather than gradient descent + hard
+    threshold. Called at the same periodic threshold-step cadence `run_phase` already
+    uses; the caller is responsible for AND-ing the returned support into the running
+    mask (monotone: support may only shrink) and writing `mask * new_Xi` back into
+    `state.params['xi']`.
+
+    Computes (z, dz_enc) over `cfg.loss.SR3_N_SAMPLES` points using the SAME
+    diff-then-encode jax.jvp path SINDyAE.__call__ uses for the consistency loss
+    (`_encode` is just `self.encoder(u, x)`, so calling `model.encoder.apply(...)`
+    wrapped in jax.jvp directly is bit-identical), batched and concatenated to numpy
+    on the host. Builds Theta(z) via the existing `theta_jax` (not a fresh
+    ps.PolynomialLibrary) so ordering/degree match the co-trained loss exactly -- and
+    verifies that claim against a numpy ps.PolynomialLibrary build on a small shared
+    sample via an assert, since a silent library-ordering mismatch would make every
+    downstream coefficient meaningless without ever raising an error.
+
+    Returns (new_Xi, new_support) as jax arrays shaped (n_library, latent_dim) --
+    matching the `xi` param leaf's orientation. pysindy's SR3.coef_ is
+    (latent_dim, n_library), the opposite convention (verified empirically, not
+    assumed); this transposes before returning, and asserts the result matches the
+    `xi` leaf's shape.
+    """
+    encoder_params = params['encoder']
+    y_full = jnp.asarray(training_data['y_spatial'])
+    n_points_full = y_full.shape[0]
+
+    n_samples = min(cfg.loss.SR3_N_SAMPLES, training_data['x'].shape[0])
+    idx = rng.choice(training_data['x'].shape[0], size=n_samples, replace=False)
+
+    batch_size = cfg.training.BATCH_SIZE
+    z_chunks, dz_chunks = [], []
+    for start in range(0, n_samples, batch_size):
+        chunk_idx = idx[start:start + batch_size]
+        b = chunk_idx.shape[0]
+
+        if cfg.model.SUBSAMPLE_POINTS:
+            key, subkey = jax.random.split(key)
+            keys = jax.random.split(subkey, b)
+            u_full = jnp.asarray(training_data['x'][chunk_idx])
+            udot_full = jnp.asarray(training_data['dx'][chunk_idx])
+
+            def pick(k, u_row, udot_row):
+                sub_idx = jax.random.choice(k, n_points_full, shape=(cfg.model.N_SUB,), replace=False)
+                return u_row[sub_idx], udot_row[sub_idx], y_full[sub_idx]
+
+            u_b, udot_b, x_b = jax.vmap(pick)(keys, u_full, udot_full)
+            u_b, udot_b, x_b = u_b[..., None], udot_b[..., None], x_b[..., None]
+        else:
+            u_b = jnp.asarray(training_data['x'][chunk_idx])[..., None]
+            udot_b = jnp.asarray(training_data['dx'][chunk_idx])[..., None]
+            x_b = jnp.broadcast_to(y_full[None, :, None], (b, n_points_full, 1))
+
+        enc = lambda uu: model.encoder.apply({'params': encoder_params}, uu, x_b)
+        z_b, dz_b = jax.jvp(enc, (u_b,), (udot_b,))
+        z_chunks.append(np.array(z_b))
+        dz_chunks.append(np.array(dz_b))
+
+    z_np = np.concatenate(z_chunks, axis=0)
+    dz_np = np.concatenate(dz_chunks, axis=0)
+
+    # library identity guard -- the #1 silent failure mode: JAX builder vs numpy
+    # PolynomialLibrary must agree on a shared sample before we trust either.
+    z_probe = z_np[:min(64, z_np.shape[0])]
+    theta_jax_probe = np.array(theta_jax(jnp.asarray(z_probe), cfg.model.POLY_ORDER, cfg.model.LATENT_DIM))
+    _lib_probe = ps.PolynomialLibrary(degree=cfg.model.POLY_ORDER, include_bias=True)
+    _lib_probe.fit([np.zeros((2, cfg.model.LATENT_DIM))])
+    theta_np_probe = _lib_probe.transform(z_probe)
+    if not np.allclose(theta_jax_probe, theta_np_probe, atol=1e-5, rtol=1e-5):
+        raise AssertionError(
+            "sr3_refit: theta_jax(...) and ps.PolynomialLibrary(...) disagree on this z "
+            "sample -- library ordering/degree mismatch. Refusing to fit SR3 on an "
+            "unverified library."
+        )
+
+    Theta_np = np.array(theta_jax(jnp.asarray(z_np), cfg.model.POLY_ORDER, cfg.model.LATENT_DIM))
+
+    opt = ps.SR3(
+        reg_weight_lam=cfg.loss.SR3_LAM,
+        regularizer='L0',
+        relax_coeff_nu=cfg.loss.SR3_NU,
+    )
+    opt.fit(Theta_np, dz_np)
+    coef = np.asarray(opt.coef_)  # pysindy convention: (latent_dim, n_library)
+
+    new_Xi_np = coef.T  # -> (n_library, latent_dim), our convention
+    if new_Xi_np.shape != params['xi'].shape:
+        raise AssertionError(
+            f"sr3_refit: new_Xi shape {new_Xi_np.shape} does not match the xi leaf's "
+            f"shape {params['xi'].shape} after transpose -- orientation assumption is wrong."
+        )
+
+    new_Xi = jnp.asarray(new_Xi_np)
+    new_support = (new_Xi != 0).astype(jnp.float32)
+
+    active = int(new_support.sum())
+    residual = float(np.mean((Theta_np @ new_Xi_np - dz_np) ** 2))
+    print(f'SR3 refit: active {active}/{new_support.size}  residual(mean sq) {residual:.3e}  '
+          f'max|Xi| {np.abs(new_Xi_np).max():.3f}  n_samples {n_samples}')
+    print('SR3 support (rows=library terms, cols=latent dims):')
+    print(np.array(new_support).astype(int))
+    print('SR3 coefficients:')
+    print(new_Xi_np)
+
+    return new_Xi, new_support
+
+
+def _reset_xi_adam_moments(opt_state):
+    """
+    Zero the Adam (mu, nu) moment estimates for the `xi` leaf only, leaving the shared
+    `count` (global step, used for every leaf's bias correction) and every other leaf
+    (encoder, decoder) untouched. Used after an SR3 refit overwrites `xi` directly,
+    since the old moments would otherwise be stale relative to the just-overwritten
+    value -- a transient that would fight the new value for the first several steps.
+    """
+    adam_state, *rest = opt_state
+    new_mu = dict(adam_state.mu)
+    new_nu = dict(adam_state.nu)
+    new_mu['xi'] = jnp.zeros_like(adam_state.mu['xi'])
+    new_nu['xi'] = jnp.zeros_like(adam_state.nu['xi'])
+    new_adam_state = adam_state._replace(mu=new_mu, nu=new_nu)
+    return (new_adam_state, *rest)
+
 
 def make_decoder(cfg):
     
@@ -182,7 +341,7 @@ def make_train_step(cfg):
 
 
 def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, checkpoint_every=50_000,
-          resume_from=None):
+          resume_from=None, key=None):
     """
     Train `model` with hard sequential thresholding of the SINDy coefficients `xi`
     (STLSQ-style: |xi| < cfg.loss.THRESHOLD -> 0), drawing random batches straight
@@ -192,6 +351,11 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     `mask` frozen and the sparsity loss dropped entirely, letting the surviving
     coefficients settle to their best-fit values without the L1 term's residual
     shrinkage bias.
+
+    If `cfg.model.SUBSAMPLE_POINTS` is set, batches are drawn with `sample_batch_subsampled`
+    instead of `sample_batch` -- every row gets its own independently-random `cfg.model.N_SUB`-point
+    subset of the grid, rather than every row sharing the same fixed full grid -- and
+    `key` (a jax.random.PRNGKey) must be given; it's split fresh every step.
 
     If `checkpoint_path` is given, {params, opt_state, mask, loss_hist} are pickled
     there every `checkpoint_every` steps and again at the end -- with step budgets
@@ -209,6 +373,11 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     Returns the final TrainState, the final (pruned) mask, and a history of the
     per-step loss terms.
     """
+    if cfg.model.SUBSAMPLE_POINTS and key is None:
+        raise ValueError("cfg.model.SUBSAMPLE_POINTS is True but no `key` (jax.random.PRNGKey) was given")
+    if cfg.loss.SPARSITY_METHOD == 'sr3' and key is None:
+        raise ValueError("cfg.loss.SPARSITY_METHOD is 'sr3' but no `key` (jax.random.PRNGKey) was given")
+
     tx = optax.adam(learning_rate=optax.exponential_decay(
         cfg.training.LEARNING_RATE,
         transition_steps=cfg.training.LR_TRANSITION_STEPS,
@@ -236,9 +405,16 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     steps_already_done = int(state.step)
 
     def run_phase(state, mask, n_steps, train_step, do_threshold, step_offset, start_i=0):
+        nonlocal key
         for i in range(start_i + 1, n_steps + 1):
             step = step_offset + i
-            u_t, u_dot, x = sample_batch(training_data, cfg.training.BATCH_SIZE, rng)
+            if cfg.model.SUBSAMPLE_POINTS:
+                key, subkey = jax.random.split(key)
+                u_t, u_dot, x = sample_batch_subsampled(
+                    training_data, cfg.training.BATCH_SIZE, cfg.model.N_SUB, rng, subkey,
+                )
+            else:
+                u_t, u_dot, x = sample_batch(training_data, cfg.training.BATCH_SIZE, rng)
             state, total, aux = train_step(state, u_t, u_dot, x, mask)
             loss_hist.append({k: float(v) for k, v in aux.items()})
 
@@ -251,9 +427,19 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
                       f'  ({rate:.1f} steps/s, elapsed {elapsed/60:.1f} min, ETA {eta_min:.1f} min)')
 
             if do_threshold and i >= cfg.loss.THRESH_START and i % cfg.loss.THRESH_EVERY == 0:
-                xi_np = np.abs(np.array(state.params['xi']))
-                mask = mask * jnp.array((xi_np >= cfg.loss.THRESHOLD).astype(np.float32))
-                print(f'prune @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
+                if cfg.loss.SPARSITY_METHOD == 'sr3':
+                    key, sr3_key = jax.random.split(key)
+                    new_Xi, new_support = sr3_refit(model, state.params, cfg, training_data, rng, sr3_key)
+                    mask = mask * new_support  # monotone: support may only shrink, never resurrect
+                    new_params = dict(state.params)
+                    new_params['xi'] = mask * new_Xi
+                    new_opt_state = _reset_xi_adam_moments(state.opt_state)
+                    state = state.replace(params=new_params, opt_state=new_opt_state)
+                    print(f'SR3 refit @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
+                else:
+                    xi_np = np.abs(np.array(state.params['xi']))
+                    mask = mask * jnp.array((xi_np >= cfg.loss.THRESHOLD).astype(np.float32))
+                    print(f'prune @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
 
             if checkpoint_path is not None and step % checkpoint_every == 0:
                 save_checkpoint(checkpoint_path, state, mask, loss_hist)
@@ -333,9 +519,14 @@ if __name__ == "__main__":
     )
 
     key = jax.random.PRNGKey(cfg.model.SEED)
-    key, init_key = jax.random.split(key)
+    key, init_key, subsample_key = jax.random.split(key, 3)
     rng = np.random.default_rng(cfg.model.SEED)
-    u0, udot0, x0 = sample_batch(training_data, cfg.training.BATCH_SIZE, rng)
+    if cfg.model.SUBSAMPLE_POINTS:
+        u0, udot0, x0 = sample_batch_subsampled(
+            training_data, cfg.training.BATCH_SIZE, cfg.model.N_SUB, rng, subsample_key,
+        )
+    else:
+        u0, udot0, x0 = sample_batch(training_data, cfg.training.BATCH_SIZE, rng)
 
     mask = jnp.ones((N_FEATURES, cfg.model.LATENT_DIM))
     params = model.init(init_key, u0, udot0, x0, mask)['params']
@@ -350,5 +541,6 @@ if __name__ == "__main__":
         checkpoint_path=checkpoint_path,
         checkpoint_every=50_000,
         resume_from=resume_from,
+        key=key,
     )
 
