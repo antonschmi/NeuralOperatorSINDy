@@ -437,6 +437,14 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
                     state = state.replace(params=new_params, opt_state=new_opt_state)
                     print(f'SR3 refit @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
                 else:
+                    # Flat threshold, matching Champion et al.'s actual pipeline (no degree
+                    # correction) -- see the docstring above _threshold_scale for why the
+                    # theoretically-derived correction isn't safe to apply here: it assumes
+                    # z_enc sits at the same scale as the true (1/40-normalized) state, which
+                    # nothing in training actually guarantees, especially without the
+                    # variance gauge-fix (LAMBDA_VAR) pinning it. Applying it caused real
+                    # terms to be pruned when the encoder's actual latent scale drifted from
+                    # that assumption -- observed: down to 3/60 active terms, too sparse.
                     xi_np = np.abs(np.array(state.params['xi']))
                     mask = mask * jnp.array((xi_np >= cfg.loss.THRESHOLD).astype(np.float32))
                     print(f'prune @ {step}: active {int(np.array(mask).sum())}/{mask.size}')

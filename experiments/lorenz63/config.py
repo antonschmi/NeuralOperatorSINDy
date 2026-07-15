@@ -11,18 +11,18 @@ class ExperimentalConfig:
     BETA       = 8 / 3
     RHO        = 28.
     NOISE_STRENGTH: float = 1e-6
-    N_ICS: int = 1024
+    N_ICS: int = 2048
     N_VAL: int = 20
     SEED: int = 42
     LINEAR_OBS: bool = True   # True -> linear Legendre observation; False -> + cubic terms
     DECODER: str = "linear"  # "linear" (DeepONet-style, linear in z) | "nonlinear" (MLP over concat(z, x))
-    SUBSAMPLE_POINTS: bool = True  # if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
-    N_SUB: int = 64          # points per row when SUBSAMPLE_POINTS is True; ignored otherwise
+    SUBSAMPLE_POINTS: bool = True # if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
+    N_SUB: int = 32       # points per row when SUBSAMPLE_POINTS is True; ignored otherwise
 
 
 @dataclass
 class TrainingConfig:
-    BATCH_SIZE: int = 1024
+    BATCH_SIZE: int = 8000
     LEARNING_RATE: float = 1e-3
     LR_TRANSITION_STEPS: int = 62500  # rescaled x125 to preserve the ~20-period mild decay shape over the new step budget
     LR_DECAY_RATE: float = 0.99
@@ -38,13 +38,9 @@ class LossConfig:
     LAMBDA_SP: float = 1e-5
     LAMBDA_VAR: float = 1.0  # gauge fix: pins Var(z_k) ~= 1, breaks the latent scale symmetry
     THRESHOLD: float = 0.1
-    THRESH_START: int = 125_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch (first prune fires here, not before)
-    THRESH_EVERY: int = 125_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch
-
-    # Path A: at each threshold step, 'sr3' replaces the absolute-threshold mask update
-    # (xi_np >= THRESHOLD) with a full pysindy SR3 solve on Theta(z) computed from the
-    # frozen encoder, instead of thresholding the co-trained xi directly. THRESHOLD is
-    # unused when SPARSITY_METHOD == 'sr3'.
+    THRESH_START: int = 32_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch (first prune fires here, not before)
+    THRESH_EVERY: int = 32_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch
+    
     SPARSITY_METHOD: str = 'relative_threshold'  # 'relative_threshold' (default, existing behavior) | 'sr3'
     SR3_LAM: float = 0.05        # pysindy SR3 reg_weight_lam (L0 regularization weight)
     SR3_NU: float = 1.0          # pysindy SR3 relax_coeff_nu
