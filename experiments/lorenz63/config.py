@@ -14,8 +14,9 @@ class ExperimentalConfig:
     N_ICS: int = 2048
     N_VAL: int = 20
     SEED: int = 42
-    LINEAR_OBS: bool = True   # True -> linear Legendre observation; False -> + cubic terms
-    DECODER: str = "linear"  # "linear" (DeepONet-style, linear in z) | "nonlinear" (MLP over concat(z, x))
+    LINEAR_OBS: bool = False  # True -> linear Legendre observation; False -> + cubic terms
+    INCLUDE_SINE: bool = False  # Lorenz's SINDy library needs no sine terms; reaction-diffusion's does
+    DECODER: str = "nonlinear"  # "linear" (DeepONet-style, linear in z) | "nonlinear" (MLP over concat(z, x))
     SUBSAMPLE_POINTS: bool = True # if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
     N_SUB: int = 32       # points per row when SUBSAMPLE_POINTS is True; ignored otherwise
 

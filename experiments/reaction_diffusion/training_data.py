@@ -1,97 +1,72 @@
 import numpy as np
-from scipy.integrate import odeint
+import scipy.io as sio
+from pathlib import Path
 
 
-def get_pendulum_data(n_ics):
-    t,x,dx,ddx,z = generate_pendulum_data(n_ics)
-    data = {}
-    data['t'] = t
-    data['x'] = x.reshape((n_ics*t.size, -1))
-    data['dx'] = dx.reshape((n_ics*t.size, -1))
-    data['ddx'] = ddx.reshape((n_ics*t.size, -1))
-    data['z'] = z.reshape((n_ics*t.size, -1))[:,0:1]
-    data['dz'] = z.reshape((n_ics*t.size, -1))[:,1:2]
+def get_rd_data(mat_path, noise_strength=1e-6, random_split=True, seed=None):
+    """
+    Load Champion et al.'s lambda-omega reaction-diffusion dataset, produced by
+    `rd_solver/reaction_diffusion.m` (run once in MATLAB -- see that script's header
+    comment; it saves `reaction_diffusion.mat` directly into this experiment's folder).
 
-    return data
+    Only the `u` channel is used as the autoencoder's field -- `v`/`dv` are loaded but
+    discarded, exactly matching Champion's own `get_rd_data` (`example_reactiondiffusion.py`),
+    which never feeds `v` into the autoencoder either.
 
+    Returns `(training_data, val_data, test_data)`, each a dict with:
+      't'         : (n_samples,) time stamps
+      'x'         : (n_samples, N) field values u(y,t), N = n_grid**2 = 10_000
+      'dx'        : (n_samples, N) field time-derivatives u_t(y,t)
+      'y_spatial' : (N, 2) shared (y1, y2) spatial grid, identical for every row
 
-def generate_pendulum_data(n_ics):
-    f  = lambda z, t : [z[1], -np.sin(z[0])]
-    t = np.arange(0, 10, .02)
+    matching the (x, dx, y_spatial) contract `sample_batch`/`sample_batch_subsampled`
+    (`src/training.py`) already expect from the Lorenz experiment -- so both experiments
+    can share the same batching code unmodified.
+    """
+    mat_path = Path(mat_path)
+    if not mat_path.exists():
+        raise FileNotFoundError(
+            f"{mat_path} not found -- run rd_solver/reaction_diffusion.m in MATLAB first "
+            f"(it saves reaction_diffusion.mat directly into this folder)."
+        )
+    data = sio.loadmat(mat_path)
+    rng = np.random.default_rng(seed)
 
-    z = np.zeros((n_ics,t.size,2))
-    dz = np.zeros(z.shape)
+    n_samples = data['t'].size
+    n = data['x'].size          # grid points per axis (100)
+    N = n * n                  # total field points (10_000)
 
-    z1range = np.array([-np.pi,np.pi])
-    z2range = np.array([-2.1,2.1])
-    i = 0
-    while (i < n_ics):
-        z0 = np.array([(z1range[1]-z1range[0])*np.random.rand()+z1range[0],
-            (z2range[1]-z2range[0])*np.random.rand()+z2range[0]])
-        if np.abs(z0[1]**2/2. - np.cos(z0[0])) > .99:
-            continue
-        z[i] = odeint(f, z0, t)
-        dz[i] = np.array([f(z[i,j], t[j]) for j in range(len(t))])
-        i += 1
+    uf = data['uf'] + noise_strength * rng.standard_normal(data['uf'].shape)
+    duf = data['duf'] + noise_strength * rng.standard_normal(data['duf'].shape)
 
-    x,dx,ddx = pendulum_to_movie(z, dz)
+    # Shared (y1, y2) grid. The flattening convention here must match uf.reshape((N, -1))
+    # below: numpy's default meshgrid indexing ('xy') reproduces MATLAB's [X,Y]=meshgrid(x,y),
+    # and both use the same default row-major (C-order) reshape, so flat index k = i*n+j
+    # corresponds to (x[j], y[i]) consistently in both the field values and this coordinate array.
+    x_1d = data['x'].ravel()
+    y_1d = data['y'].ravel()
+    Xg, Yg = np.meshgrid(x_1d, y_1d)
+    y_spatial = np.stack([Xg.reshape(-1), Yg.reshape(-1)], axis=-1).astype(np.float32)
 
-    # n = 51
-    # xx,yy = np.meshgrid(np.linspace(-1.5,1.5,n),np.linspace(1.5,-1.5,n))
-    # create_image = lambda theta : np.exp(-((xx-np.cos(theta-np.pi/2))**2 + (yy-np.sin(theta-np.pi/2))**2)/.05)
-    # argument_derivative = lambda theta,dtheta : -1/.05*(2*(xx - np.cos(theta-np.pi/2))*np.sin(theta-np.pi/2)*dtheta \
-    #                                                   + 2*(yy - np.sin(theta-np.pi/2))*(-np.cos(theta-np.pi/2))*dtheta)
-    # argument_derivative2 = lambda theta,dtheta,ddtheta : -2/.05*((np.sin(theta-np.pi/2))*np.sin(theta-np.pi/2)*dtheta**2 \
-    #                                                            + (xx - np.cos(theta-np.pi/2))*np.cos(theta-np.pi/2)*dtheta**2 \
-    #                                                            + (xx - np.cos(theta-np.pi/2))*np.sin(theta-np.pi/2)*ddtheta \
-    #                                                            + (-np.cos(theta-np.pi/2))*(-np.cos(theta-np.pi/2))*dtheta**2 \
-    #                                                            + (yy - np.sin(theta-np.pi/2))*(np.sin(theta-np.pi/2))*dtheta**2 \
-    #                                                            + (yy - np.sin(theta-np.pi/2))*(-np.cos(theta-np.pi/2))*ddtheta)
-        
-    # x = np.zeros((n_ics, t.size, n, n))
-    # dx = np.zeros((n_ics, t.size, n, n))
-    # ddx = np.zeros((n_ics, t.size, n, n))
-    # for i in range(n_ics):
-    #     for j in range(t.size):
-    #         z[i,j,0] = wrap_to_pi(z[i,j,0])
-    #         x[i,j] = create_image(z[i,j,0])
-    #         dx[i,j] = (create_image(z[i,j,0])*argument_derivative(z[i,j,0], dz[i,j,0]))
-    #         ddx[i,j] = create_image(z[i,j,0])*((argument_derivative(z[i,j,0], dz[i,j,0]))**2 \
-    #                         + argument_derivative2(z[i,j,0], dz[i,j,0], dz[i,j,1]))
+    if not random_split:
+        # sequential blocks: first 80% train, next 10% val, last 10% test
+        training_samples = np.arange(int(.8 * n_samples))
+        val_samples = np.arange(int(.8 * n_samples), int(.9 * n_samples))
+    else:
+        # Champion's default: random 80/10 split of the first 90% of samples
+        perm = rng.permutation(int(.9 * n_samples))
+        training_samples = perm[:int(.8 * n_samples)]
+        val_samples = perm[int(.8 * n_samples):]
+    # last 10% of samples always strictly held out as test, in both cases -- matches
+    # Champion's get_rd_data (tests temporal extrapolation, not interpolation)
+    test_samples = np.arange(int(.9 * n_samples), n_samples)
 
-    return t,x,dx,ddx,z
+    def _subset(idx):
+        return {
+            't': data['t'].ravel()[idx],
+            'x': uf[:, :, idx].reshape((N, -1)).T.astype(np.float32),
+            'dx': duf[:, :, idx].reshape((N, -1)).T.astype(np.float32),
+            'y_spatial': y_spatial,
+        }
 
-
-def pendulum_to_movie(z, dz):
-    n_ics = z.shape[0]
-    n_samples = z.shape[1]
-    n = 51
-    y1,y2 = np.meshgrid(np.linspace(-1.5,1.5,n),np.linspace(1.5,-1.5,n))
-    create_image = lambda theta : np.exp(-((y1-np.cos(theta-np.pi/2))**2 + (y2-np.sin(theta-np.pi/2))**2)/.05)
-    argument_derivative = lambda theta,dtheta : -1/.05*(2*(y1 - np.cos(theta-np.pi/2))*np.sin(theta-np.pi/2)*dtheta \
-                                                      + 2*(y2 - np.sin(theta-np.pi/2))*(-np.cos(theta-np.pi/2))*dtheta)
-    argument_derivative2 = lambda theta,dtheta,ddtheta : -2/.05*((np.sin(theta-np.pi/2))*np.sin(theta-np.pi/2)*dtheta**2 \
-                                                               + (y1 - np.cos(theta-np.pi/2))*np.cos(theta-np.pi/2)*dtheta**2 \
-                                                               + (y1 - np.cos(theta-np.pi/2))*np.sin(theta-np.pi/2)*ddtheta \
-                                                               + (-np.cos(theta-np.pi/2))*(-np.cos(theta-np.pi/2))*dtheta**2 \
-                                                               + (y2 - np.sin(theta-np.pi/2))*(np.sin(theta-np.pi/2))*dtheta**2 \
-                                                               + (y2 - np.sin(theta-np.pi/2))*(-np.cos(theta-np.pi/2))*ddtheta)
-        
-    x = np.zeros((n_ics, n_samples, n, n))
-    dx = np.zeros((n_ics, n_samples, n, n))
-    ddx = np.zeros((n_ics, n_samples, n, n))
-    for i in range(n_ics):
-        for j in range(n_samples):
-            z[i,j,0] = wrap_to_pi(z[i,j,0])
-            x[i,j] = create_image(z[i,j,0])
-            dx[i,j] = (create_image(z[i,j,0])*argument_derivative(z[i,j,0], dz[i,j,0]))
-            ddx[i,j] = create_image(z[i,j,0])*((argument_derivative(z[i,j,0], dz[i,j,0]))**2 \
-                            + argument_derivative2(z[i,j,0], dz[i,j,0], dz[i,j,1]))
-            
-    return x,dx,ddx
-
-
-def wrap_to_pi(z):
-    z_mod = z % (2*np.pi)
-    subtract_m = (z_mod > np.pi) * (-2*np.pi)
-    return z_mod + subtract_m
+    return _subset(training_samples), _subset(val_samples), _subset(test_samples)

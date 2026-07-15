@@ -63,6 +63,18 @@ def load_or_create_lorenz_data(path, n_ics, noise_strength, linear=True):
     return data
 
 
+def _coords(data):
+    """
+    Normalize `data['y_spatial']` to shape [n_points, in_dim]. Lorenz's cached data
+    stores a 1D grid ([n_points], in_dim=1 implicit); reaction-diffusion's 2D (y1,y2)
+    grid is already [n_points, 2]. Keeping this check here (rather than forcing every
+    experiment's data loader to agree on a convention) means the existing Lorenz .npz
+    cache never needs regenerating just to satisfy a shape contract.
+    """
+    y = jnp.asarray(data['y_spatial'])
+    return y[:, None] if y.ndim == 1 else y
+
+
 def sample_batch(data, batch_size, rng):
     """
     Draw a random batch of (u, u_dot, x) from a get_lorenz_data-style dict, in place
@@ -72,10 +84,8 @@ def sample_batch(data, batch_size, rng):
     idx = rng.choice(data['x'].shape[0], size=batch_size, replace=False)
     u = jnp.asarray(data['x'][idx])[..., None]        # [B, n_points, 1]
     u_dot = jnp.asarray(data['dx'][idx])[..., None]    # [B, n_points, 1]
-    x = jnp.broadcast_to(
-        jnp.asarray(data['y_spatial'])[None, :, None],
-        (batch_size, data['y_spatial'].shape[0], 1),
-    )
+    y = _coords(data)                                  # [n_points, in_dim]
+    x = jnp.broadcast_to(y[None, :, :], (batch_size, *y.shape))
     return u, u_dot, x
 
 
@@ -96,7 +106,7 @@ def sample_batch_subsampled(data, batch_size, n_sub, rng, key):
     idx = rng.choice(data['x'].shape[0], size=batch_size, replace=False)
     u_full = jnp.asarray(data['x'][idx])          # [B, n_points_full]
     udot_full = jnp.asarray(data['dx'][idx])      # [B, n_points_full]
-    y_full = jnp.asarray(data['y_spatial'])       # [n_points_full]
+    y_full = _coords(data)                        # [n_points_full, in_dim]
     n_points_full = y_full.shape[0]
 
     keys = jax.random.split(key, batch_size)
@@ -106,15 +116,16 @@ def sample_batch_subsampled(data, batch_size, n_sub, rng, key):
         return u_row[sub_idx], udot_row[sub_idx], y_full[sub_idx]
 
     u, udot, x = jax.vmap(pick_and_gather)(keys, u_full, udot_full)
-    return u[..., None], udot[..., None], x[..., None]
+    return u[..., None], udot[..., None], x   # x is already [B, n_sub, in_dim]
 
 
-def theta_jax(z, poly_order, latent_dim):
+def theta_jax(z, poly_order, latent_dim, include_sine=False):
     """
-    JAX polynomial library matching ps.PolynomialLibrary(degree=poly_order, include_bias=True).
-
-    For clean JAX derivative computiation.
-
+    JAX polynomial (+ optional sine) library, for clean JAX derivative computation.
+    Matches `build_feature_library`'s column order exactly: polynomial terms up to
+    `poly_order` (with bias) first, then, if `include_sine`, sin(z_i) for each i
+    appended last -- Champion et al.'s convention (`sindy_library`/`sindy_library_tf`),
+    needed for reaction-diffusion and the pendulum but not Lorenz.
     """
     B = z.shape[0]
     cols = [jnp.ones(B)]
@@ -124,7 +135,30 @@ def theta_jax(z, poly_order, latent_dim):
             for k in idx:
                 feat = feat * z[:, k]
             cols.append(feat)
+    if include_sine:
+        for i in range(latent_dim):
+            cols.append(jnp.sin(z[:, i]))
     return jnp.stack(cols, axis=-1)
+
+
+def build_feature_library(poly_order, latent_dim, include_sine=False):
+    """
+    Build the pysindy library used to size Theta(z) (`N_FEATURES`) and to get
+    human-readable feature names -- matching `theta_jax`'s column order exactly.
+
+    Returns a fitted library exposing `.n_output_features_` and `.transform(z)`.
+    Feature names are read through `.get_feature_names(...)`, which both
+    `PolynomialLibrary` and `ConcatLibrary` support (unlike the sklearn-style
+    `get_feature_names_out` alias, which `ConcatLibrary` does not implement).
+    """
+    poly = ps.PolynomialLibrary(degree=poly_order, include_bias=True)
+    if not include_sine:
+        lib = poly
+    else:
+        fourier = ps.FourierLibrary(n_frequencies=1, include_sin=True, include_cos=False)
+        lib = ps.ConcatLibrary([poly, fourier])
+    lib.fit([np.zeros((2, latent_dim))])
+    return lib
 
 
 def sr3_refit(model, params, cfg, training_data, rng, key):
@@ -155,8 +189,9 @@ def sr3_refit(model, params, cfg, training_data, rng, key):
     `xi` leaf's shape.
     """
     encoder_params = params['encoder']
-    y_full = jnp.asarray(training_data['y_spatial'])
+    y_full = _coords(training_data)
     n_points_full = y_full.shape[0]
+    include_sine = getattr(cfg.model, 'INCLUDE_SINE', False)
 
     n_samples = min(cfg.loss.SR3_N_SAMPLES, training_data['x'].shape[0])
     idx = rng.choice(training_data['x'].shape[0], size=n_samples, replace=False)
@@ -178,11 +213,11 @@ def sr3_refit(model, params, cfg, training_data, rng, key):
                 return u_row[sub_idx], udot_row[sub_idx], y_full[sub_idx]
 
             u_b, udot_b, x_b = jax.vmap(pick)(keys, u_full, udot_full)
-            u_b, udot_b, x_b = u_b[..., None], udot_b[..., None], x_b[..., None]
+            u_b, udot_b = u_b[..., None], udot_b[..., None]   # x_b is already [b, N_SUB, in_dim]
         else:
             u_b = jnp.asarray(training_data['x'][chunk_idx])[..., None]
             udot_b = jnp.asarray(training_data['dx'][chunk_idx])[..., None]
-            x_b = jnp.broadcast_to(y_full[None, :, None], (b, n_points_full, 1))
+            x_b = jnp.broadcast_to(y_full[None, :, :], (b, *y_full.shape))
 
         enc = lambda uu: model.encoder.apply({'params': encoder_params}, uu, x_b)
         z_b, dz_b = jax.jvp(enc, (u_b,), (udot_b,))
@@ -193,20 +228,19 @@ def sr3_refit(model, params, cfg, training_data, rng, key):
     dz_np = np.concatenate(dz_chunks, axis=0)
 
     # library identity guard -- the #1 silent failure mode: JAX builder vs numpy
-    # PolynomialLibrary must agree on a shared sample before we trust either.
+    # library must agree on a shared sample before we trust either.
     z_probe = z_np[:min(64, z_np.shape[0])]
-    theta_jax_probe = np.array(theta_jax(jnp.asarray(z_probe), cfg.model.POLY_ORDER, cfg.model.LATENT_DIM))
-    _lib_probe = ps.PolynomialLibrary(degree=cfg.model.POLY_ORDER, include_bias=True)
-    _lib_probe.fit([np.zeros((2, cfg.model.LATENT_DIM))])
+    theta_jax_probe = np.array(theta_jax(jnp.asarray(z_probe), cfg.model.POLY_ORDER, cfg.model.LATENT_DIM, include_sine))
+    _lib_probe = build_feature_library(cfg.model.POLY_ORDER, cfg.model.LATENT_DIM, include_sine)
     theta_np_probe = _lib_probe.transform(z_probe)
     if not np.allclose(theta_jax_probe, theta_np_probe, atol=1e-5, rtol=1e-5):
         raise AssertionError(
-            "sr3_refit: theta_jax(...) and ps.PolynomialLibrary(...) disagree on this z "
+            "sr3_refit: theta_jax(...) and build_feature_library(...) disagree on this z "
             "sample -- library ordering/degree mismatch. Refusing to fit SR3 on an "
             "unverified library."
         )
 
-    Theta_np = np.array(theta_jax(jnp.asarray(z_np), cfg.model.POLY_ORDER, cfg.model.LATENT_DIM))
+    Theta_np = np.array(theta_jax(jnp.asarray(z_np), cfg.model.POLY_ORDER, cfg.model.LATENT_DIM, include_sine))
 
     opt = ps.SR3(
         reg_weight_lam=cfg.loss.SR3_LAM,
@@ -291,6 +325,7 @@ class SINDyAE(nn.Module):
     n_features: int            # p = theta library size
     latent_dim: int
     poly_order: int
+    include_sine: bool = False  # reaction-diffusion needs sin(z_i) terms; Lorenz doesn't
 
     def _encode(self, u, x):
         # encode
@@ -310,7 +345,7 @@ class SINDyAE(nn.Module):
         z, dz_enc = jax.jvp(enc, (u_t,), (u_dot,))
 
         # SINDy prediction of the latent velocity (masked coefficients)
-        dz_sindy = theta_jax(z, self.poly_order, self.latent_dim) @ (mask * xi)
+        dz_sindy = theta_jax(z, self.poly_order, self.latent_dim, self.include_sine) @ (mask * xi)
 
         # decoder-side: reconstruction and predicted field
         dec = lambda zz: self.decoder(zz, x)
