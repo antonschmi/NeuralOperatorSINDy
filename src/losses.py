@@ -45,4 +45,5 @@ def sindy_ae_loss(cfg, model, batch, mask):
         "loss_dx": loss_dx,
         "loss_sp": loss_sp,
         "loss_var": loss_var,
+        "z": z,  # per-batch latent codes -- for diagnostic logging only, never persisted to loss_hist
     }

@@ -289,6 +289,41 @@ def _reset_xi_adam_moments(opt_state):
     return (new_adam_state, *rest)
 
 
+def _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done):
+    """
+    Print the full loss breakdown and per-latent-dimension z statistics for the batch
+    just trained on. Meant to run far less often than the per-step loss_hist bookkeeping
+    (every `log_every` steps, and whenever a checkpoint is saved) -- this is for human
+    monitoring at the console, not analysis, so unlike loss_hist none of it is persisted.
+
+    The per-dimension `z std` row is the direct diagnostic for "has a latent variable
+    been turned off": `LAMBDA_VAR`'s gauge-fix pushes every axis toward Var(z_k) ~= 1,
+    so a std collapsing toward 0 on some axis means that axis has become an
+    (uninformative) near-constant -- visible here immediately, well before it would
+    show up in the aggregate loss_var number alone (loss_var is a mean over the whole
+    latent_dim x latent_dim covariance matrix, so one dead axis can be swamped by the
+    others and stay hidden in that single scalar).
+    """
+    elapsed = time.time() - t_start
+    done_this_run = step - steps_already_done
+    rate = done_this_run / elapsed if elapsed > 0 else float('nan')
+    eta_min = (total_steps - step) / rate / 60 if rate > 0 else float('nan')
+    n_active = int(np.array(mask).sum())
+
+    z = np.array(aux['z'])
+    z_mean = z.mean(axis=0)
+    z_std = z.std(axis=0)
+
+    print(f'[log {step}/{total_steps}]  ({rate:.1f} steps/s, elapsed {elapsed/60:.1f} min, ETA {eta_min:.1f} min)')
+    print(f'  loss {float(aux["loss"]):.3e}  rec {float(aux["loss_rec"]):.3e}  '
+          f'dz {float(aux["loss_dz"]):.3e}  dx {float(aux["loss_dx"]):.3e}  '
+          f'sp {float(aux["loss_sp"]):.3e}  var {float(aux["loss_var"]):.3e}  '
+          f'active {n_active}/{mask.size}')
+    with np.printoptions(precision=3, suppress=True):
+        print(f'  z mean {z_mean}')
+        print(f'  z std  {z_std}')
+
+
 def make_decoder(cfg):
     
     """
@@ -376,7 +411,7 @@ def make_train_step(cfg):
 
 
 def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, checkpoint_every=50_000,
-          resume_from=None, key=None):
+          resume_from=None, key=None, log_every=10_000):
     """
     Train `model` with hard sequential thresholding of the SINDy coefficients `xi`
     (STLSQ-style: |xi| < cfg.loss.THRESHOLD -> 0), drawing random batches straight
@@ -396,6 +431,12 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     there every `checkpoint_every` steps and again at the end -- with step budgets
     in the hundreds of thousands to millions, this is what makes a run recoverable
     after a Colab disconnect or any other mid-training interruption.
+
+    Every `log_every` steps, and again whenever a checkpoint is saved, the full loss
+    breakdown (not just `max|xi|`) and the per-latent-dimension mean/std of `z` for
+    that step's batch are printed to the console (see `_log_diagnostics`) -- this is
+    console-only monitoring, not persisted, and separate from the per-step scalar loss
+    terms that get appended to `loss_hist` every step regardless.
 
     `resume_from`, if given, is a `load_checkpoint(...)` payload: training picks up
     from the saved params/opt_state/mask/loss_hist and `state.step` rather than
@@ -451,7 +492,10 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
             else:
                 u_t, u_dot, x = sample_batch(training_data, cfg.training.BATCH_SIZE, rng)
             state, total, aux = train_step(state, u_t, u_dot, x, mask)
-            loss_hist.append({k: float(v) for k, v in aux.items()})
+            loss_hist.append({k: float(v) for k, v in aux.items() if k != 'z'})
+
+            if step % log_every == 0:
+                _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done)
 
             if i % 1000 == 0 or i == start_i + 1:
                 elapsed = time.time() - t_start
@@ -487,6 +531,8 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
             if checkpoint_path is not None and step % checkpoint_every == 0:
                 save_checkpoint(checkpoint_path, state, mask, loss_hist)
                 print(f'checkpoint saved @ {step} -> {checkpoint_path}')
+                if step % log_every != 0:  # avoid printing the same diagnostics twice if the cadences coincide
+                    _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done)
         return state, mask
 
     train_step = make_train_step(cfg)
