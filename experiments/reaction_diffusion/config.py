@@ -8,7 +8,8 @@ class ExperimentalConfig:
     N_GRID: int = 100          # spatial grid points per axis -> N_GRID**2 = 10_000 field points, matching Champion
     NOISE_STRENGTH: float = 1e-6  # matches Champion's added Gaussian noise on uf/duf
     SEED: int = 42
-    DECODER: str = "linear"    # "linear" (DeepONet-style, linear in z) | "nonlinear" (MLP over concat(z, x))
+    DECODER: str = "linear"    # "linear" (DeepONet-style, linear in z, no branch net) | "nonlinear" (MLP over
+                               # concat(z, x), z and x entangled) | "deeponet" (full branch(z)+trunk(x) DeepONet)
     SUBSAMPLE_POINTS: bool = True  # mesh-invariance test -- no Champion equivalent, this project's own extension
     N_SUB: int = 1000          # points per row when SUBSAMPLE_POINTS is True (10% of the 10_000-point grid; tune freely)
     MAT_PATH: str = "reaction_diffusion.mat"  # produced by rd_solver/reaction_diffusion.m (run once in MATLAB)

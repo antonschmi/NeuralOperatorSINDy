@@ -17,18 +17,34 @@ def sindy_ae_loss(cfg, model, batch, mask):
                               can collapse into redundant copies of the same direction (each
                               individually satisfying Var(z_k)=1) without the SINDy library ever
                               seeing an actually 3-dimensional latent state.
+
+    Each term is only computed if its `cfg.loss.LAMBDA_*` weight is nonzero -- a weight of
+    0.0 means "not used" (e.g. lorenz63's LAMBDA_DZ/LAMBDA_VAR right now), so the term
+    contributes nothing to `total` either way, but computing it regardless would waste
+    work for no observable effect (loss_var's Cov(z) matmul is the one real cost here;
+    the others are cheap, but the same guard is applied uniformly for consistency and so
+    aux's reported value for a disabled term reads as an explicit 0.0, not a stray
+    nonzero number an unfamiliar reader might mistake for something being enforced).
+    `cfg.loss.LAMBDA_*` are plain Python floats on `cfg` (not JAX tracers), so this `if`
+    is resolved at trace time -- a disabled term's branch never even gets compiled into
+    the jitted train_step, not merely skipped at runtime.
     """
     u_t, u_dot, x = batch
     u_hat, z, dz_enc, dz_sindy, du_dec, xi = model(u_t, u_dot, x, mask)
 
-    loss_rec = jnp.mean((u_hat - u_t) ** 2)
-    loss_dz = jnp.mean((dz_enc - dz_sindy) ** 2)
-    loss_dx = jnp.mean((du_dec - u_dot) ** 2)
-    loss_sp = jnp.mean(jnp.abs(mask * xi))
+    zero = jnp.asarray(0.0)
 
-    z_centered = z - jnp.mean(z, axis=0, keepdims=True)
-    cov = (z_centered.T @ z_centered) / z.shape[0]
-    loss_var = jnp.mean((cov - jnp.eye(cov.shape[0])) ** 2)
+    loss_rec = jnp.mean((u_hat - u_t) ** 2) if cfg.loss.LAMBDA_REC > 0 else zero
+    loss_dz = jnp.mean((dz_enc - dz_sindy) ** 2) if cfg.loss.LAMBDA_DZ > 0 else zero
+    loss_dx = jnp.mean((du_dec - u_dot) ** 2) if cfg.loss.LAMBDA_DX > 0 else zero
+    loss_sp = jnp.mean(jnp.abs(mask * xi)) if cfg.loss.LAMBDA_SP > 0 else zero
+
+    if cfg.loss.LAMBDA_VAR > 0:
+        z_centered = z - jnp.mean(z, axis=0, keepdims=True)
+        cov = (z_centered.T @ z_centered) / z.shape[0]
+        loss_var = jnp.mean((cov - jnp.eye(cov.shape[0])) ** 2)
+    else:
+        loss_var = zero
 
     total = (
         cfg.loss.LAMBDA_REC * loss_rec

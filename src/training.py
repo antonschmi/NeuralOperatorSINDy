@@ -44,6 +44,7 @@ def load_checkpoint(path):
 from src.encoder.pooling_encoder import PoolingEncoder
 from src.decoder.linear_decoder import LinearDecoder
 from src.decoder.non_linear_decoder import NonlinearDecoder
+from src.decoder.deeponet_decoder import DeepONetDecoder
 from src.utils.networks.pooling import DeepSetPooling
 from experiments.lorenz63.training_data import (get_lorenz_data, library_size)
 from experiments.lorenz63.config import Config
@@ -289,20 +290,72 @@ def _reset_xi_adam_moments(opt_state):
     return (new_adam_state, *rest)
 
 
-def _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done):
+def _encode_correlation(model, params, training_data, rng, n_samples=512):
     """
-    Print the full loss breakdown and per-latent-dimension z statistics for the batch
-    just trained on. Meant to run far less often than the per-step loss_hist bookkeeping
-    (every `log_every` steps, and whenever a checkpoint is saved) -- this is for human
-    monitoring at the console, not analysis, so unlike loss_hist none of it is persisted.
+    Encode a small, fresh random sample of `training_data` and correlate each latent
+    channel against each column of the known true state `training_data['z']` -- the
+    same check `analysis.ipynb`'s coordinate-recovery cell does post-hoc, just live.
 
-    The per-dimension `z std` row is the direct diagnostic for "has a latent variable
-    been turned off": `LAMBDA_VAR`'s gauge-fix pushes every axis toward Var(z_k) ~= 1,
-    so a std collapsing toward 0 on some axis means that axis has become an
-    (uninformative) near-constant -- visible here immediately, well before it would
-    show up in the aggregate loss_var number alone (loss_var is a mean over the whole
-    latent_dim x latent_dim covariance matrix, so one dead axis can be swamped by the
-    others and stay hidden in that single scalar).
+    Only meaningful for experiments that ship a ground-truth low-dimensional state to
+    compare against (Lorenz does -- the field is a synthetic lift of a known 3-number
+    state, kept purely for validation). Returns None for experiments like
+    reaction-diffusion, where there is no known low-dimensional ground truth at all;
+    callers must handle that rather than assuming a matrix comes back.
+
+    Uses its own dedicated `rng`, independent of the training batch sampler's `rng`, so
+    this diagnostic never perturbs the actual sequence of training batches drawn.
+    """
+    if 'z' not in training_data:
+        return None
+
+    # `x`/`dx` are flattened by get_lorenz_data to one row per (ic, timestep) snapshot
+    # -- but `z` (straight out of generate_lorenz_data) keeps its original
+    # (n_ics, n_steps, latent_dim) shape and is never reshaped to match. Flatten it the
+    # same way (row-major, identical convention to x's own `.reshape((-1, input_dim))`)
+    # before indexing with the same `idx` used for x, so z_true[k] and x[k] refer to
+    # the same (ic, timestep) snapshot rather than indexing into the wrong axis.
+    z_all = np.asarray(training_data['z'])
+    if z_all.ndim == 1:
+        z_all = z_all[:, None]
+    elif z_all.ndim > 2:
+        z_all = z_all.reshape(-1, z_all.shape[-1])
+
+    n_pool = min(training_data['x'].shape[0], z_all.shape[0])
+    n = min(n_samples, n_pool)
+    idx = rng.choice(n_pool, size=n, replace=False)
+    u = jnp.asarray(training_data['x'][idx])[..., None]
+    y = _coords(training_data)
+    x = jnp.broadcast_to(y[None, :, :], (n, *y.shape))
+    z_enc = np.array(model.encoder.apply({'params': params['encoder']}, u, x))
+
+    z_true = z_all[idx]
+
+    latent_dim = z_enc.shape[-1]
+    true_dim = z_true.shape[-1]
+    return np.array([
+        [np.corrcoef(z_enc[:, i], z_true[:, j])[0, 1] for j in range(true_dim)]
+        for i in range(latent_dim)
+    ])
+
+
+def _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done,
+                      model, params, training_data, diag_rng):
+    """
+    Print the full loss breakdown and, if the experiment ships a known ground-truth
+    state (Lorenz does; reaction-diffusion doesn't), a correlation matrix between each
+    encoded latent channel and each true state variable. Meant to run far less often
+    than the per-step loss_hist bookkeeping (every `log_every` steps, and whenever a
+    checkpoint is saved) -- this is for human monitoring at the console, not analysis,
+    so unlike loss_hist none of it is persisted.
+
+    The correlation matrix is a direct answer to "has a latent variable been turned
+    off, and if not, which true state variable (if any) does it actually track" -- a
+    plain per-axis mean/std can only hint at collapse (std -> 0) and says nothing about
+    whether a *non*-collapsed axis is tracking anything physically meaningful at all. A
+    genuinely collapsed (constant) axis shows up here as NaN (undefined correlation),
+    which is a more obvious signal than a small-but-nonzero std buried in a row of six
+    numbers -- and a non-collapsed but physically meaningless axis (e.g. tracking noise)
+    shows up as a row with no large entries anywhere, which mean/std could never reveal.
     """
     elapsed = time.time() - t_start
     done_this_run = step - steps_already_done
@@ -310,18 +363,22 @@ def _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done):
     eta_min = (total_steps - step) / rate / 60 if rate > 0 else float('nan')
     n_active = int(np.array(mask).sum())
 
-    z = np.array(aux['z'])
-    z_mean = z.mean(axis=0)
-    z_std = z.std(axis=0)
-
     print(f'[log {step}/{total_steps}]  ({rate:.1f} steps/s, elapsed {elapsed/60:.1f} min, ETA {eta_min:.1f} min)')
     print(f'  loss {float(aux["loss"]):.3e}  rec {float(aux["loss_rec"]):.3e}  '
           f'dz {float(aux["loss_dz"]):.3e}  dx {float(aux["loss_dx"]):.3e}  '
           f'sp {float(aux["loss_sp"]):.3e}  var {float(aux["loss_var"]):.3e}  '
           f'active {n_active}/{mask.size}')
-    with np.printoptions(precision=3, suppress=True):
-        print(f'  z mean {z_mean}')
-        print(f'  z std  {z_std}')
+
+    corr = _encode_correlation(model, params, training_data, diag_rng)
+    if corr is None:
+        print('  (no ground-truth z available for this experiment -- skipping correlation check)')
+    else:
+        with np.printoptions(precision=3, suppress=True):
+            print(f'  corr(z_enc, z_true) [rows=z_enc_i, cols=z_true_j]:\n{corr}')
+        best_match = np.argmax(np.abs(corr), axis=1)
+        max_abs = np.abs(corr).max(axis=1)
+        print(f'  best true-state match per z_enc row: {best_match.tolist()}   '
+              f'max|corr|: {np.round(max_abs, 3).tolist()}')
 
 
 def make_decoder(cfg):
@@ -329,10 +386,15 @@ def make_decoder(cfg):
     """
     Build the model's decoder from `cfg.model.DECODER`, so switching between decoders
     is a single config-file change:
-      - "linear":    LinearDecoder -- DeepONet-style, exactly linear in z (no bias)
-      - "nonlinear": NonlinearDecoder -- MLP over concat(tile(z), x), nonlinear in z
-    Both share the same (z, x) -> u call signature, so nothing else in the model needs
-    to change when switching.
+      - "linear":    LinearDecoder -- DeepONet-style, exactly linear in z (no bias),
+                     no branch net at all (z itself is the branch output)
+      - "nonlinear": NonlinearDecoder -- MLP over concat(tile(z), x), nonlinear in z,
+                     but z and x are entangled in one shared network
+      - "deeponet":  DeepONetDecoder -- full branch(z) + trunk(x) DeepONet, nonlinear
+                     in z like NonlinearDecoder, but z and x never share a network like
+                     LinearDecoder's trunk -- see DeepONetDecoder's docstring
+    All three share the same (z, x) -> u call signature, so nothing else in the model
+    needs to change when switching.
     """
     if cfg.model.DECODER == "linear":
         return LinearDecoder(
@@ -345,8 +407,19 @@ def make_decoder(cfg):
             out_dim=1,
             features=(64, 64, 64),
         )
+    elif cfg.model.DECODER == "deeponet":
+        return DeepONetDecoder(
+            out_dim=1,
+            n_basis=20,  # decoupled from LATENT_DIM -- gives the branch net room to represent
+                         # non-affine (e.g. z_i and z_i^3) dependencies without inflating the
+                         # SINDy latent dimension itself
+            branch_features=(64, 64),
+            trunk_features=(64, 64, 64),
+        )
     else:
-        raise ValueError(f"Unknown cfg.model.DECODER: {cfg.model.DECODER!r} (expected 'linear' or 'nonlinear')")
+        raise ValueError(
+            f"Unknown cfg.model.DECODER: {cfg.model.DECODER!r} (expected 'linear', 'nonlinear', or 'deeponet')"
+        )
 
 
 class SINDyAE(nn.Module):
@@ -433,10 +506,11 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     after a Colab disconnect or any other mid-training interruption.
 
     Every `log_every` steps, and again whenever a checkpoint is saved, the full loss
-    breakdown (not just `max|xi|`) and the per-latent-dimension mean/std of `z` for
-    that step's batch are printed to the console (see `_log_diagnostics`) -- this is
-    console-only monitoring, not persisted, and separate from the per-step scalar loss
-    terms that get appended to `loss_hist` every step regardless.
+    breakdown (not just `max|xi|`) and, when the experiment ships a ground-truth `z`
+    (Lorenz does), a correlation matrix between encoded and true latent state are
+    printed to the console (see `_log_diagnostics`) -- this is console-only monitoring,
+    not persisted, and separate from the per-step scalar loss terms that get appended
+    to `loss_hist` every step regardless.
 
     `resume_from`, if given, is a `load_checkpoint(...)` payload: training picks up
     from the saved params/opt_state/mask/loss_hist and `state.step` rather than
@@ -479,6 +553,10 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     t_start = time.time()
     total_steps = cfg.training.MAX_STEPS + cfg.training.REFINEMENT_STEPS
     steps_already_done = int(state.step)
+    # Dedicated, independent RNG for the periodic diagnostic correlation check --
+    # deliberately separate from `rng` (used for actual training batches) so this
+    # monitoring-only computation never perturbs the training batch sequence.
+    diag_rng = np.random.default_rng(getattr(cfg.model, 'SEED', 0) + 1)
 
     def run_phase(state, mask, n_steps, train_step, do_threshold, step_offset, start_i=0):
         nonlocal key
@@ -495,7 +573,8 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
             loss_hist.append({k: float(v) for k, v in aux.items() if k != 'z'})
 
             if step % log_every == 0:
-                _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done)
+                _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done,
+                                  model, state.params, training_data, diag_rng)
 
             if i % 1000 == 0 or i == start_i + 1:
                 elapsed = time.time() - t_start
@@ -532,7 +611,8 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
                 save_checkpoint(checkpoint_path, state, mask, loss_hist)
                 print(f'checkpoint saved @ {step} -> {checkpoint_path}')
                 if step % log_every != 0:  # avoid printing the same diagnostics twice if the cadences coincide
-                    _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done)
+                    _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done,
+                                      model, state.params, training_data, diag_rng)
         return state, mask
 
     train_step = make_train_step(cfg)

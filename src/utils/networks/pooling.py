@@ -39,6 +39,11 @@ class MultiheadAttentionPooling(nn.Module):
 
 
 class DeepSetPooling(nn.Module):
+    """
+    A DeepSet style pooling function that uses an MLP to learn a representation of the input set.
+    The MLP is applied to each input element, and outputs are averaged.
+    
+    """
     mlp_dim: int = 128
     mlp_n_hidden_layers: int = 2
 

@@ -14,10 +14,11 @@ class ExperimentalConfig:
     N_ICS: int = 2048
     N_VAL: int = 20
     SEED: int = 42
-    LINEAR_OBS: bool = False  # True -> linear Legendre observation; False -> + cubic terms
+    LINEAR_OBS: bool = True  # True -> linear Legendre observation; False -> + cubic terms
     INCLUDE_SINE: bool = False  # Lorenz's SINDy library needs no sine terms; reaction-diffusion's does
-    DECODER: str = "nonlinear"  # "linear" (DeepONet-style, linear in z) | "nonlinear" (MLP over concat(z, x))
-    SUBSAMPLE_POINTS: bool = True # if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
+    DECODER: str = "linear"  # "linear" (DeepONet-style, linear in z, no branch net) | "nonlinear" (MLP over
+                                # concat(z, x), z and x entangled) | "deeponet" (full branch(z)+trunk(x) DeepONet)
+    SUBSAMPLE_POINTS: bool = False# if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
     N_SUB: int = 32       # points per row when SUBSAMPLE_POINTS is True; ignored otherwise
 
 
@@ -34,10 +35,10 @@ class TrainingConfig:
 @dataclass
 class LossConfig:
     LAMBDA_REC: float = 1.0
-    LAMBDA_DZ: float = 1.0
-    LAMBDA_DX: float = 1e-4
-    LAMBDA_SP: float = 1e-5
-    LAMBDA_VAR: float = 1.0  # gauge fix: pins Var(z_k) ~= 1, breaks the latent scale symmetry
+    LAMBDA_DZ: float = 0.0
+    LAMBDA_DX: float = 1e-2
+    LAMBDA_SP: float = 1e-3
+    LAMBDA_VAR: float = 0.0 # gauge fix: pins Var(z_k) ~= 1, breaks the latent scale symmetry
     THRESHOLD: float = 0.1
     THRESH_START: int = 32_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch (first prune fires here, not before)
     THRESH_EVERY: int = 32_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch
