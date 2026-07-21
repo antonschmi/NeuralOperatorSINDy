@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for `
 from src.encoder.pooling_encoder import PoolingEncoder
 from src.decoder.linear_decoder import LinearDecoder
 from src.decoder.non_linear_decoder import NonlinearDecoder
+from src.decoder.deeponet_decoder import DeepONetDecoder
 from src.utils.networks.pooling import DeepSetPooling
 from src.training import (
     SINDyAE, train, build_feature_library, load_checkpoint,
@@ -44,8 +45,17 @@ def make_rd_decoder(cfg):
         return LinearDecoder(out_dim=1, n_basis=cfg.model.LATENT_DIM, features=(RD_HIDDEN_WIDTH,))
     elif cfg.model.DECODER == "nonlinear":
         return NonlinearDecoder(out_dim=1, features=(RD_HIDDEN_WIDTH,))
+    elif cfg.model.DECODER == "deeponet":
+        return DeepONetDecoder(
+            out_dim=1,
+            n_basis=20,  # decoupled from LATENT_DIM, same rationale as make_decoder (src/training.py)
+            branch_features=(RD_HIDDEN_WIDTH, RD_HIDDEN_WIDTH),
+            trunk_features=(RD_HIDDEN_WIDTH,),
+        )
     else:
-        raise ValueError(f"Unknown cfg.model.DECODER: {cfg.model.DECODER!r} (expected 'linear' or 'nonlinear')")
+        raise ValueError(
+            f"Unknown cfg.model.DECODER: {cfg.model.DECODER!r} (expected 'linear', 'nonlinear', or 'deeponet')"
+        )
 
 
 if __name__ == "__main__":

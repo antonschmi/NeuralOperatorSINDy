@@ -14,11 +14,11 @@ class ExperimentalConfig:
     N_ICS: int = 2048
     N_VAL: int = 20
     SEED: int = 42
-    LINEAR_OBS: bool = True  # True -> linear Legendre observation; False -> + cubic terms
+    LINEAR_OBS: bool = False  # True -> linear Legendre observation; False -> + cubic terms
     INCLUDE_SINE: bool = False  # Lorenz's SINDy library needs no sine terms; reaction-diffusion's does
-    DECODER: str = "linear"  # "linear" (DeepONet-style, linear in z, no branch net) | "nonlinear" (MLP over
+    DECODER: str = "deeponet"  # "linear" (DeepONet-style, linear in z, no branch net) | "nonlinear" (MLP over
                                 # concat(z, x), z and x entangled) | "deeponet" (full branch(z)+trunk(x) DeepONet)
-    SUBSAMPLE_POINTS: bool = False# if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
+    SUBSAMPLE_POINTS: bool = False # if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
     N_SUB: int = 32       # points per row when SUBSAMPLE_POINTS is True; ignored otherwise
 
 
@@ -43,8 +43,8 @@ class LossConfig:
     THRESH_START: int = 32_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch (first prune fires here, not before)
     THRESH_EVERY: int = 32_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch
     
-    SPARSITY_METHOD: str = 'relative_threshold'  # 'relative_threshold' (default, existing behavior) | 'sr3'
-    SR3_LAM: float = 0.05        # pysindy SR3 reg_weight_lam (L0 regularization weight)
+    SPARSITY_METHOD: str = 'sr3'  # 'relative_threshold' (default, existing behavior) | 'sr3'
+    SR3_LAM: float = 0.1       # pysindy SR3 reg_weight_lam (L0 regularization weight)
     SR3_NU: float = 1.0          # pysindy SR3 relax_coeff_nu
     SR3_N_SAMPLES: int = 20_000  # fixed subsample size (rows of training_data) used for each SR3 solve
 

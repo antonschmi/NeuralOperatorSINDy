@@ -8,13 +8,15 @@ class ExperimentalConfig:
     N_GRID: int = 100          # spatial grid points per axis -> N_GRID**2 = 10_000 field points, matching Champion
     NOISE_STRENGTH: float = 1e-6  # matches Champion's added Gaussian noise on uf/duf
     SEED: int = 42
-    DECODER: str = "linear"    # "linear" (DeepONet-style, linear in z, no branch net) | "nonlinear" (MLP over
+    DECODER: str = "deeponet"    # "linear" (DeepONet-style, linear in z, no branch net) | "nonlinear" (MLP over
                                # concat(z, x), z and x entangled) | "deeponet" (full branch(z)+trunk(x) DeepONet)
     SUBSAMPLE_POINTS: bool = True  # mesh-invariance test -- no Champion equivalent, this project's own extension
-    N_SUB: int = 1000          # points per row when SUBSAMPLE_POINTS is True (10% of the 10_000-point grid; tune freely)
+    N_SUB: int = 3000          # points per row when SUBSAMPLE_POINTS is True (10% of the 10_000-point grid; tune freely)
     MAT_PATH: str = "reaction_diffusion.mat"  # produced by rd_solver/reaction_diffusion.m (run once in MATLAB)
     RANDOM_SPLIT: bool = True  # True: Champion's random 80/10 split of the first 90% of samples (get_rd_data(random=True));
                                # False: sequential blocks. Last 10% of samples always held out as test either way.
+    LINEAR_OBS: bool = False  # True -> linear Legendre observation; False -> + cubic terms
+    INCLUDE_SINE: bool = True  # Lorenz's SINDy library needs no sine terms; reaction-diffusion's does
 
 
 @dataclass
@@ -33,12 +35,12 @@ class LossConfig:
     LAMBDA_DZ: float = 0.01   # Champion's loss_weight_sindy_z for reaction-diffusion (NOT Lorenz's weight)
     LAMBDA_DX: float = 0.5    # Champion's loss_weight_sindy_x for reaction-diffusion
     LAMBDA_SP: float = 0.1    # Champion's loss_weight_sindy_regularization for reaction-diffusion
-    LAMBDA_VAR: float = 1.0   # gauge fix: pins Cov(z) ~= I -- no Champion equivalent, kept on as in lorenz63
+    LAMBDA_VAR: float = 0.1   # gauge fix: pins Cov(z) ~= I -- no Champion equivalent, kept on as in lorenz63
     THRESHOLD: float = 0.1
     THRESH_START: int = 4_000  # = Champion's threshold_frequency=500 epochs * 8 steps/epoch (first prune fires here)
     THRESH_EVERY: int = 4_000
 
-    SPARSITY_METHOD: str = 'relative_threshold'  # 'relative_threshold' (default, existing behavior) | 'sr3'
+    SPARSITY_METHOD: str = 'sr3'  # 'relative_threshold' (default, existing behavior) | 'sr3'
     SR3_LAM: float = 0.05        # pysindy SR3 reg_weight_lam (L0 regularization weight)
     SR3_NU: float = 1.0          # pysindy SR3 relax_coeff_nu
     SR3_N_SAMPLES: int = 8_000   # fixed subsample size (rows of training_data) used for each SR3 solve
