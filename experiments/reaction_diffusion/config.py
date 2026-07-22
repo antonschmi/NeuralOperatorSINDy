@@ -11,7 +11,8 @@ class ExperimentalConfig:
     DECODER: str = "deeponet"    # "linear" (DeepONet-style, linear in z, no branch net) | "nonlinear" (MLP over
                                # concat(z, x), z and x entangled) | "deeponet" (full branch(z)+trunk(x) DeepONet)
     SUBSAMPLE_POINTS: bool = True  # mesh-invariance test -- no Champion equivalent, this project's own extension
-    N_SUB: int = 3000          # points per row when SUBSAMPLE_POINTS is True (10% of the 10_000-point grid; tune freely)
+    N_SUB: int = 1000          # points per row when SUBSAMPLE_POINTS is True (10% of the 10_000-point grid; tune freely)
+    ENCODER_FEATURES: list = field(default_factory=lambda: [256, 256])  # DeepSetPooling per-point MLP layer widths
     MAT_PATH: str = "reaction_diffusion.mat"  # produced by rd_solver/reaction_diffusion.m (run once in MATLAB)
     RANDOM_SPLIT: bool = True  # True: Champion's random 80/10 split of the first 90% of samples (get_rd_data(random=True));
                                # False: sequential blocks. Last 10% of samples always held out as test either way.

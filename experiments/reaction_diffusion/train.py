@@ -32,12 +32,8 @@ from src.training import (
 from experiments.reaction_diffusion.config import Config
 from experiments.reaction_diffusion.training_data import get_rd_data
 
-RD_HIDDEN_WIDTH = 256  # Champion's Table S2 encoder/decoder width for reaction-diffusion
-# NOTE: DeepSetPooling's per-point MLP is `MLP([mlp_dim] * mlp_n_hidden_layers)`, unlike
-# LinearDecoder/NonlinearDecoder where `features` is hidden-only and the true output
-# width is appended separately. That means mlp_n_hidden_layers=1 here would collapse to
-# a single *unactivated* Dense(256) -- no nonlinearity at all before pooling -- so this
-# keeps mlp_n_hidden_layers=2 (matching Lorenz's default depth) and only widens mlp_dim.
+RD_HIDDEN_WIDTH = 256  # Champion's Table S2 decoder width for reaction-diffusion (encoder
+# width/depth now comes from cfg.model.ENCODER_FEATURES instead -- see DeepSetPooling)
 
 
 def make_rd_decoder(cfg):
@@ -80,7 +76,7 @@ if __name__ == "__main__":
         encoder=PoolingEncoder(
             latent_dim=cfg.model.LATENT_DIM,
             is_variational=False,
-            pooling_fn=DeepSetPooling(mlp_dim=RD_HIDDEN_WIDTH, mlp_n_hidden_layers=2),
+            pooling_fn=DeepSetPooling(features=cfg.model.ENCODER_FEATURES),
         ),
         decoder=make_rd_decoder(cfg),
         n_features=N_FEATURES,

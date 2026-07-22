@@ -677,7 +677,7 @@ if __name__ == "__main__":
         encoder=PoolingEncoder(
             latent_dim=cfg.model.LATENT_DIM,
             is_variational=False,
-            pooling_fn=DeepSetPooling(mlp_dim=64, mlp_n_hidden_layers=2),
+            pooling_fn=DeepSetPooling(features=cfg.model.ENCODER_FEATURES),
         ),
         # decoder
         decoder=make_decoder(cfg),

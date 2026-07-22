@@ -2,3 +2,6 @@ NO-SINDy.*
 *.npz
 *.pyc
 *poster
+*.pth
+*.pkl
+*.mat

@@ -20,6 +20,7 @@ class ExperimentalConfig:
                                 # concat(z, x), z and x entangled) | "deeponet" (full branch(z)+trunk(x) DeepONet)
     SUBSAMPLE_POINTS: bool = False # if True, each batch row gets its own random n_sub-point subset of the grid (mesh-invariance test) instead of the fixed full grid
     N_SUB: int = 32       # points per row when SUBSAMPLE_POINTS is True; ignored otherwise
+    ENCODER_FEATURES: list = field(default_factory=lambda: [64, 64])  # DeepSetPooling per-point MLP layer widths
 
 
 @dataclass

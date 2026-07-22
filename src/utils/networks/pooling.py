@@ -1,3 +1,5 @@
+from typing import Sequence
+
 import jax.numpy as jnp
 import flax.linen as nn
 from src.utils.networks import MLP, MultiheadLinearAttentionLayer
@@ -42,13 +44,17 @@ class DeepSetPooling(nn.Module):
     """
     A DeepSet style pooling function that uses an MLP to learn a representation of the input set.
     The MLP is applied to each input element, and outputs are averaged.
-    
     """
-    mlp_dim: int = 128
-    mlp_n_hidden_layers: int = 2
+    features: Sequence[int] = (128, 128)
+    """
+    Per-point MLP layer widths, e.g. `(256, 256)` for two hidden layers of width 256.
+    Matches `MLP.features`: every entry gets an activation except the last, which is the
+    (unactivated) per-point embedding width that gets mean-pooled -- a single-entry
+    tuple therefore collapses to one unactivated Dense layer before pooling.
+    """
 
     @nn.compact
     def __call__(self, u, x):
-        z = MLP([self.mlp_dim] * self.mlp_n_hidden_layers)(u)
+        z = MLP(list(self.features))(u)
         z = z.mean(axis=1)
         return z
