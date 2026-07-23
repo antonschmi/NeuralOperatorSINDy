@@ -99,25 +99,30 @@ def sample_batch_subsampled(data, batch_size, n_sub, rng, key):
     forced the encoder/decoder to handle heterogeneous point clouds within a single
     gradient step -- this is the actual test of the mesh-invariance claim.
 
-    `key` is an ordinary jax.random.PRNGKey, split fresh by the caller every call; kept
-    separate from `rng` (the numpy Generator used for the outer ic/timestep sampling,
-    unchanged from `sample_batch`) since the per-point subsampling runs through
-    jax.random so it can be vmapped across the batch.
+    Subsampling indices are drawn on the HOST via `rng` (numpy), not on-device. The
+    previous implementation transferred the full n_points_full-length row to device for
+    every batch row before subsampling (up to 10x more data than n_sub actually needs),
+    and used jax.random.choice for the without-replacement draw, whose cost scales with
+    n_points_full regardless of how small n_sub is. Both were pure overhead sitting on
+    the GPU's critical path. The per-row draw itself is vectorized via argsort-of-random
+    (standard trick for "n_sub distinct random indices per row, no Python loop, no
+    replacement"), so this stays a single host-side numpy call rather than batch_size
+    separate rng.choice calls. `key` is no longer consumed here (nothing left runs
+    through jax.random) but is kept in the signature for compatibility with callers'
+    PRNG-splitting convention.
     """
     idx = rng.choice(data['x'].shape[0], size=batch_size, replace=False)
-    u_full = jnp.asarray(data['x'][idx])          # [B, n_points_full]
-    udot_full = jnp.asarray(data['dx'][idx])      # [B, n_points_full]
-    y_full = _coords(data)                        # [n_points_full, in_dim]
-    n_points_full = y_full.shape[0]
+    y_full_np = np.asarray(_coords(data))          # [n_points_full, in_dim], host
+    n_points_full = y_full_np.shape[0]
 
-    keys = jax.random.split(key, batch_size)
+    sub_idx = np.argsort(rng.random((batch_size, n_points_full)), axis=1)[:, :n_sub]
+    row_idx = idx[:, None]
 
-    def pick_and_gather(k, u_row, udot_row):
-        sub_idx = jax.random.choice(k, n_points_full, shape=(n_sub,), replace=False)
-        return u_row[sub_idx], udot_row[sub_idx], y_full[sub_idx]
+    u = jnp.asarray(data['x'][row_idx, sub_idx])[..., None]        # [B, n_sub, 1]
+    udot = jnp.asarray(data['dx'][row_idx, sub_idx])[..., None]    # [B, n_sub, 1]
+    x = jnp.asarray(y_full_np[sub_idx])                             # [B, n_sub, in_dim]
 
-    u, udot, x = jax.vmap(pick_and_gather)(keys, u_full, udot_full)
-    return u[..., None], udot[..., None], x   # x is already [B, n_sub, in_dim]
+    return u, udot, x
 
 
 def theta_jax(z, poly_order, latent_dim, include_sine=False):
@@ -463,15 +468,53 @@ class SINDyAE(nn.Module):
     
 
 
-def make_train_step(cfg):
+def make_train_step(cfg, n_points_full):
     """
-    Build a jitted training step. `cfg` (and its weighted loss terms) is closed over
-    rather than passed in, since it never changes over the course of training and
+    Build a jitted training step that ALSO performs batch/point sampling on-device
+    (row selection via jax.random.choice, per-row point subsampling via vmap), given
+    the full training dataset already resident on device. Folding sampling into the
+    same jit as the forward/backward pass means each step is a single async-dispatched
+    XLA computation with no host-side numpy work on the critical path in between.
+
+    Previously, batch prep (sample_batch/sample_batch_subsampled) ran as ordinary
+    Python/numpy code between train_step calls -- the host had to finish that work
+    before it could even dispatch the next step, so the GPU sat idle waiting on it
+    regardless of how cheap that host-side work was made (observed: low, "bursty" GPU
+    utilization even after speeding up and reducing the host-side work itself). Since
+    JAX dispatch is asynchronous, the fix is to remove the host round-trip from the
+    hot loop entirely, not to make it faster.
+
+    `cfg` (and its weighted loss terms) and `n_points_full` (the full grid's point
+    count, needed for the per-row subsample draw) are both closed over as plain Python
+    values rather than passed in, since neither changes over the course of training and
     dataclasses aren't valid jit arguments.
     """
+    subsample = cfg.model.SUBSAMPLE_POINTS
+    batch_size = cfg.training.BATCH_SIZE
+    n_sub = cfg.model.N_SUB
 
     @jax.jit
-    def train_step(state, u_t, u_dot, x, mask):
+    def train_step(state, key, data_x, data_dx, data_y, mask):
+        idx_key, sub_key = jax.random.split(key)
+        idx = jax.random.choice(idx_key, data_x.shape[0], shape=(batch_size,), replace=False)
+        u_full = data_x[idx]        # [B, n_points_full]
+        udot_full = data_dx[idx]    # [B, n_points_full]
+
+        if subsample:
+            keys = jax.random.split(sub_key, batch_size)
+
+            def pick(k, u_row, udot_row):
+                sub_idx = jax.random.choice(k, n_points_full, shape=(n_sub,), replace=False)
+                return u_row[sub_idx], udot_row[sub_idx], data_y[sub_idx]
+
+            u, udot, x = jax.vmap(pick)(keys, u_full, udot_full)
+        else:
+            u, udot = u_full, udot_full
+            x = jnp.broadcast_to(data_y[None, :, :], (batch_size, *data_y.shape))
+
+        u_t = u[..., None]
+        u_dot = udot[..., None]
+
         def loss_fn(params):
             bound_model = lambda *a: state.apply_fn({'params': params}, *a)
             return sindy_ae_loss(cfg, bound_model, (u_t, u_dot, x), mask)
@@ -495,10 +538,11 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     coefficients settle to their best-fit values without the L1 term's residual
     shrinkage bias.
 
-    If `cfg.model.SUBSAMPLE_POINTS` is set, batches are drawn with `sample_batch_subsampled`
-    instead of `sample_batch` -- every row gets its own independently-random `cfg.model.N_SUB`-point
-    subset of the grid, rather than every row sharing the same fixed full grid -- and
-    `key` (a jax.random.PRNGKey) must be given; it's split fresh every step.
+    Batch/point sampling happens on-device inside `train_step` itself (see
+    `make_train_step`) -- `key` is split fresh every step and threaded through, always
+    required. If `cfg.model.SUBSAMPLE_POINTS` is set, every row gets its own
+    independently-random `cfg.model.N_SUB`-point subset of the grid, rather than every
+    row sharing the same fixed full grid.
 
     If `checkpoint_path` is given, {params, opt_state, mask, loss_hist} are pickled
     there every `checkpoint_every` steps and again at the end -- with step budgets
@@ -523,10 +567,9 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     Returns the final TrainState, the final (pruned) mask, and a history of the
     per-step loss terms.
     """
-    if cfg.model.SUBSAMPLE_POINTS and key is None:
-        raise ValueError("cfg.model.SUBSAMPLE_POINTS is True but no `key` (jax.random.PRNGKey) was given")
-    if cfg.loss.SPARSITY_METHOD == 'sr3' and key is None:
-        raise ValueError("cfg.loss.SPARSITY_METHOD is 'sr3' but no `key` (jax.random.PRNGKey) was given")
+    if key is None:
+        raise ValueError("train() now always needs `key` (jax.random.PRNGKey): train_step draws its own "
+                          "batch/point sampling on-device every step, regardless of SUBSAMPLE_POINTS")
 
     tx = optax.adam(learning_rate=optax.exponential_decay(
         cfg.training.LEARNING_RATE,
@@ -558,19 +601,43 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
     # monitoring-only computation never perturbs the training batch sequence.
     diag_rng = np.random.default_rng(getattr(cfg.model, 'SEED', 0) + 1)
 
+    # Full dataset moved to device ONCE, up front -- train_step now does batch/point
+    # sampling on-device every step (see make_train_step), so there's no per-step
+    # host->device transfer left in the hot loop, only this one-time cost.
+    data_x_dev = jnp.asarray(training_data['x'])
+    data_dx_dev = jnp.asarray(training_data['dx'])
+    data_y_dev = _coords(training_data)
+    n_points_full = data_y_dev.shape[0]
+
     def run_phase(state, mask, n_steps, train_step, do_threshold, step_offset, start_i=0):
         nonlocal key
+        # Aux dicts are held here as device arrays (no `float()`) and only synced to host
+        # floats in batches (`flush_pending`), instead of every single step. JAX dispatches
+        # `train_step` asynchronously, so back-to-back steps can overlap host-side batch
+        # prep (sample_batch*) with GPU compute for the previous step(s) -- but only if
+        # nothing forces a host sync in between. Converting `aux` to floats every step (the
+        # previous behavior) was exactly such a sync: it blocked the loop until the current
+        # step's result was ready before it could even start preparing the next one, leaving
+        # the GPU idle while the host was busy, and the host idle while waiting on the GPU.
+        pending_aux = []
+        LOSS_HIST_FLUSH_EVERY = 100
+
+        def flush_pending():
+            for a in pending_aux:
+                loss_hist.append({k: float(v) for k, v in a.items()})
+            pending_aux.clear()
+
         for i in range(start_i + 1, n_steps + 1):
             step = step_offset + i
-            if cfg.model.SUBSAMPLE_POINTS:
-                key, subkey = jax.random.split(key)
-                u_t, u_dot, x = sample_batch_subsampled(
-                    training_data, cfg.training.BATCH_SIZE, cfg.model.N_SUB, rng, subkey,
-                )
-            else:
-                u_t, u_dot, x = sample_batch(training_data, cfg.training.BATCH_SIZE, rng)
-            state, total, aux = train_step(state, u_t, u_dot, x, mask)
-            loss_hist.append({k: float(v) for k, v in aux.items() if k != 'z'})
+            key, step_key = jax.random.split(key)
+            # Batch/point sampling happens INSIDE train_step now (see make_train_step) --
+            # no host-side numpy work here at all, just a cheap key split and a call to an
+            # already-compiled function, so the host can dispatch the next step immediately
+            # rather than blocking on host-side batch prep first.
+            state, total, aux = train_step(state, step_key, data_x_dev, data_dx_dev, data_y_dev, mask)
+            pending_aux.append({k: v for k, v in aux.items() if k != 'z'})
+            if len(pending_aux) >= LOSS_HIST_FLUSH_EVERY:
+                flush_pending()
 
             if step % log_every == 0:
                 _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done,
@@ -588,12 +655,26 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
                 if cfg.loss.SPARSITY_METHOD == 'sr3':
                     key, sr3_key = jax.random.split(key)
                     new_Xi, new_support = sr3_refit(model, state.params, cfg, training_data, rng, sr3_key)
-                    mask = mask * new_support  # monotone: support may only shrink, never resurrect
-                    new_params = dict(state.params)
-                    new_params['xi'] = mask * new_Xi
-                    new_opt_state = _reset_xi_adam_moments(state.opt_state)
-                    state = state.replace(params=new_params, opt_state=new_opt_state)
-                    print(f'SR3 refit @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
+                    candidate_mask = mask * new_support  # monotone: support may only shrink, never resurrect
+                    if int(np.array(candidate_mask).sum()) == 0:
+                        # A refit that wipes every term out is never useful to lock in: since
+                        # the mask update is monotone (AND-only), applying an all-zero support
+                        # would permanently kill the SINDy layer for the rest of this run --
+                        # every later refit ANDs against a mask that's already all-zero, so it
+                        # can never recover. Most often this means SR3_LAM/SR3_NU are miscalibrated
+                        # for the coefficients' actual scale at this point in training (or
+                        # THRESH_START fired before the latent dynamics had settled), not that
+                        # zero real terms exist -- so skip this refit and keep the previous mask,
+                        # rather than silently committing to a dead model.
+                        print(f'SR3 refit @ {step}: new support is all-zero -- skipping, keeping '
+                              f'previous mask (active {int(np.array(mask).sum())}/{mask.size})')
+                    else:
+                        mask = candidate_mask
+                        new_params = dict(state.params)
+                        new_params['xi'] = mask * new_Xi
+                        new_opt_state = _reset_xi_adam_moments(state.opt_state)
+                        state = state.replace(params=new_params, opt_state=new_opt_state)
+                        print(f'SR3 refit @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
                 else:
                     # Flat threshold, matching Champion et al.'s actual pipeline (no degree
                     # correction) -- see the docstring above _threshold_scale for why the
@@ -608,14 +689,16 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
                     print(f'prune @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
 
             if checkpoint_path is not None and step % checkpoint_every == 0:
+                flush_pending()  # loss_hist must be current as of this step before it's pickled
                 save_checkpoint(checkpoint_path, state, mask, loss_hist)
                 print(f'checkpoint saved @ {step} -> {checkpoint_path}')
                 if step % log_every != 0:  # avoid printing the same diagnostics twice if the cadences coincide
                     _log_diagnostics(step, total_steps, aux, mask, t_start, steps_already_done,
                                       model, state.params, training_data, diag_rng)
+        flush_pending()  # don't lose whatever's still pending when the phase ends
         return state, mask
 
-    train_step = make_train_step(cfg)
+    train_step = make_train_step(cfg, n_points_full)
     main_start_i = min(steps_already_done, cfg.training.MAX_STEPS)
     if main_start_i < cfg.training.MAX_STEPS:
         state, mask = run_phase(state, mask, cfg.training.MAX_STEPS, train_step, do_threshold=True,
@@ -629,7 +712,7 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
         if refinement_start_i < cfg.training.REFINEMENT_STEPS:
             print('REFINEMENT')
             refinement_cfg = dataclasses.replace(cfg, loss=dataclasses.replace(cfg.loss, LAMBDA_SP=0.0))
-            refinement_train_step = make_train_step(refinement_cfg)
+            refinement_train_step = make_train_step(refinement_cfg, n_points_full)
             state, mask = run_phase(
                 state, mask, cfg.training.REFINEMENT_STEPS, refinement_train_step,
                 do_threshold=False, step_offset=cfg.training.MAX_STEPS, start_i=refinement_start_i,

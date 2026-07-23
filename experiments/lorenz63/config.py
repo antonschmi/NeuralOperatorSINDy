@@ -39,7 +39,7 @@ class LossConfig:
     LAMBDA_DZ: float = 0.0
     LAMBDA_DX: float = 1e-2
     LAMBDA_SP: float = 1e-3
-    LAMBDA_VAR: float = 0.0 # gauge fix: pins Var(z_k) ~= 1, breaks the latent scale symmetry
+    LAMBDA_VAR: float = 1.0 # gauge fix: pins Var(z_k) ~= 1, breaks the latent scale symmetry
     THRESHOLD: float = 0.1
     THRESH_START: int = 32_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch (first prune fires here, not before)
     THRESH_EVERY: int = 32_000  # = Champion's threshold_frequency=500 epochs * 250 steps/epoch

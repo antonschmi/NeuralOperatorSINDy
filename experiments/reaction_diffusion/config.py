@@ -33,12 +33,22 @@ class TrainingConfig:
 @dataclass
 class LossConfig:
     LAMBDA_REC: float = 1.0
-    LAMBDA_DZ: float = 0.01   # Champion's loss_weight_sindy_z for reaction-diffusion (NOT Lorenz's weight)
+    LAMBDA_DZ: float = 1.0    # raised from Champion's published 0.01: too weak here to force dz_enc (the
+    # encoder's own measured latent velocity) to be well-scaled/meaningful at all -- loss_rec gives it zero
+    # temporal-coupling signal (i.i.d. batches), so LAMBDA_DZ was the only thing that could anchor it, and it
+    # wasn't. Raised to LAMBDA_REC's own scale so the encoder has real pressure to produce dz-consistent z(t).
     LAMBDA_DX: float = 0.5    # Champion's loss_weight_sindy_x for reaction-diffusion
-    LAMBDA_SP: float = 0.1    # Champion's loss_weight_sindy_regularization for reaction-diffusion
+    LAMBDA_SP: float = 0.01   # lowered from 0.1: at the old 10x-stronger-than-LAMBDA_DZ ratio, sparsity
+    # squeezed xi toward zero before dz-consistency ever had a chance to establish real structure (confirmed:
+    # max|xi| never plateaued before the first threshold event, collapsing to 1/24 active terms).
     LAMBDA_VAR: float = 0.1   # gauge fix: pins Cov(z) ~= I -- no Champion equivalent, kept on as in lorenz63
     THRESHOLD: float = 0.1
-    THRESH_START: int = 4_000  # = Champion's threshold_frequency=500 epochs * 8 steps/epoch (first prune fires here)
+    THRESH_START: int = 12_000  # pushed back from Champion's 500-epoch (4_000-step) schedule: with
+    # LAMBDA_DZ=0.01 pulling only weakly on the encoder, z(t)'s dynamics haven't settled into anything
+    # a sparse polynomial library can fit that early -- firing SR3 at 4_000 observed the fit collapse
+    # to 0/24 active terms (coefficients scaled far below SR3_LAM/SR3_NU's implied threshold), and
+    # since the mask update is monotone (AND-only, see run_phase), that wipeout is permanent for the
+    # rest of the run. 12_000 (50% of MAX_STEPS) gives loss_dz materially longer to fall first.
     THRESH_EVERY: int = 4_000
 
     SPARSITY_METHOD: str = 'sr3'  # 'relative_threshold' (default, existing behavior) | 'sr3'
