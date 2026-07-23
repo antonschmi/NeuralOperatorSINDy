@@ -1,6 +1,7 @@
 import dataclasses
 import pickle
 import time
+import warnings
 import pysindy as ps
 import jax
 import numpy as np
@@ -253,7 +254,18 @@ def sr3_refit(model, params, cfg, training_data, rng, key):
         regularizer='L0',
         relax_coeff_nu=cfg.loss.SR3_NU,
     )
-    opt.fit(Theta_np, dz_np)
+    # pysindy's SR3._reduce raises a plain ConvergenceWarning (via a for/else on its
+    # iteration loop) when the convergence criterion is never satisfied within
+    # max_iter -- a non-converged fit's coefficients aren't a reliable optimum, just
+    # whatever the last iteration happened to land on, and observed in practice to
+    # correlate directly with runaway coefficient magnitude (a non-converged refit
+    # feeding an already-large Xi back into `xi` producing an even larger one at the
+    # next refit). Captured here rather than left to print past the caller, so
+    # `run_phase` can refuse to apply a refit it has no reason to trust.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        opt.fit(Theta_np, dz_np)
+    converged = not any('did not converge' in str(w.message) for w in caught)
     coef = np.asarray(opt.coef_)  # pysindy convention: (latent_dim, n_library)
 
     new_Xi_np = coef.T  # -> (n_library, latent_dim), our convention
@@ -269,13 +281,13 @@ def sr3_refit(model, params, cfg, training_data, rng, key):
     active = int(new_support.sum())
     residual = float(np.mean((Theta_np @ new_Xi_np - dz_np) ** 2))
     print(f'SR3 refit: active {active}/{new_support.size}  residual(mean sq) {residual:.3e}  '
-          f'max|Xi| {np.abs(new_Xi_np).max():.3f}  n_samples {n_samples}')
+          f'max|Xi| {np.abs(new_Xi_np).max():.3f}  n_samples {n_samples}  converged {converged}')
     print('SR3 support (rows=library terms, cols=latent dims):')
     print(np.array(new_support).astype(int))
     print('SR3 coefficients:')
     print(new_Xi_np)
 
-    return new_Xi, new_support
+    return new_Xi, new_support, converged
 
 
 def _reset_xi_adam_moments(opt_state):
@@ -654,27 +666,38 @@ def train(cfg, model, params, mask, training_data, rng, checkpoint_path=None, ch
             if do_threshold and i >= cfg.loss.THRESH_START and i % cfg.loss.THRESH_EVERY == 0:
                 if cfg.loss.SPARSITY_METHOD == 'sr3':
                     key, sr3_key = jax.random.split(key)
-                    new_Xi, new_support = sr3_refit(model, state.params, cfg, training_data, rng, sr3_key)
-                    candidate_mask = mask * new_support  # monotone: support may only shrink, never resurrect
-                    if int(np.array(candidate_mask).sum()) == 0:
-                        # A refit that wipes every term out is never useful to lock in: since
-                        # the mask update is monotone (AND-only), applying an all-zero support
-                        # would permanently kill the SINDy layer for the rest of this run --
-                        # every later refit ANDs against a mask that's already all-zero, so it
-                        # can never recover. Most often this means SR3_LAM/SR3_NU are miscalibrated
-                        # for the coefficients' actual scale at this point in training (or
-                        # THRESH_START fired before the latent dynamics had settled), not that
-                        # zero real terms exist -- so skip this refit and keep the previous mask,
-                        # rather than silently committing to a dead model.
-                        print(f'SR3 refit @ {step}: new support is all-zero -- skipping, keeping '
+                    new_Xi, new_support, converged = sr3_refit(model, state.params, cfg, training_data, rng, sr3_key)
+                    if not converged:
+                        # A refit whose optimizer never converged has no reliable answer to
+                        # offer -- observed to correlate directly with runaway |Xi| (a
+                        # non-converged fit feeding an already-large Xi back into `xi`
+                        # produces an even larger one at the next refit). Same "don't lock in
+                        # a result we have no reason to trust" logic as the zero-support
+                        # guard below, checked first since a non-converged fit's support is
+                        # exactly as untrustworthy as its coefficients.
+                        print(f'SR3 refit @ {step}: optimizer did not converge -- skipping, keeping '
                               f'previous mask (active {int(np.array(mask).sum())}/{mask.size})')
                     else:
-                        mask = candidate_mask
-                        new_params = dict(state.params)
-                        new_params['xi'] = mask * new_Xi
-                        new_opt_state = _reset_xi_adam_moments(state.opt_state)
-                        state = state.replace(params=new_params, opt_state=new_opt_state)
-                        print(f'SR3 refit @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
+                        candidate_mask = mask * new_support  # monotone: support may only shrink, never resurrect
+                        if int(np.array(candidate_mask).sum()) == 0:
+                            # A refit that wipes every term out is never useful to lock in: since
+                            # the mask update is monotone (AND-only), applying an all-zero support
+                            # would permanently kill the SINDy layer for the rest of this run --
+                            # every later refit ANDs against a mask that's already all-zero, so it
+                            # can never recover. Most often this means SR3_LAM/SR3_NU are miscalibrated
+                            # for the coefficients' actual scale at this point in training (or
+                            # THRESH_START fired before the latent dynamics had settled), not that
+                            # zero real terms exist -- so skip this refit and keep the previous mask,
+                            # rather than silently committing to a dead model.
+                            print(f'SR3 refit @ {step}: new support is all-zero -- skipping, keeping '
+                                  f'previous mask (active {int(np.array(mask).sum())}/{mask.size})')
+                        else:
+                            mask = candidate_mask
+                            new_params = dict(state.params)
+                            new_params['xi'] = mask * new_Xi
+                            new_opt_state = _reset_xi_adam_moments(state.opt_state)
+                            state = state.replace(params=new_params, opt_state=new_opt_state)
+                            print(f'SR3 refit @ {step}: active {int(np.array(mask).sum())}/{mask.size}')
                 else:
                     # Flat threshold, matching Champion et al.'s actual pipeline (no degree
                     # correction) -- see the docstring above _threshold_scale for why the
